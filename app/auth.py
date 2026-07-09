@@ -50,7 +50,7 @@ def _now_ts() -> int:
 
 def create_access_token(user: User) -> str:
     iat = _now_ts()
-    # lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60) bug
+    # lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)    bug
     lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.id),

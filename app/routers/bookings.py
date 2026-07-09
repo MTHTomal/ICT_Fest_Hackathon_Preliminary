@@ -99,8 +99,7 @@ def create_booking(
     if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
-    # Conflict/quota checks and insert ran separately before. (previous bug)
-    with _booking_write_lock:  # bug fixed: serialize booking create checks and commit
+    with _booking_write_lock:  # bug 
         room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
         if room is None:
             raise AppError(404, "ROOM_NOT_FOUND", "Room not found")

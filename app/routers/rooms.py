@@ -108,7 +108,6 @@ def room_stats(
     user: User = Depends(get_current_user),
 ):
     room = _get_org_room(db, room_id, user.org_id)
-    # current = stats.get(room.id) (previous bug: process-local stats can drift)
     confirmed_count, revenue_cents = (
         db.query(func.count(Booking.id), func.coalesce(func.sum(Booking.price_cents), 0))
         .filter(Booking.room_id == room.id, Booking.status == "confirmed")
@@ -117,5 +116,4 @@ def room_stats(
     return {
         "room_id": room.id,
         "total_confirmed_bookings": confirmed_count,
-        "total_revenue_cents": revenue_cents,  # bug fixed: stats are derived from persisted bookings
-    }
+        "total_revenue_cents": revenue_cents,  # bug fixed
