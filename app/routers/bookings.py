@@ -121,6 +121,7 @@ def create_booking(
     db.refresh(booking)
 
     stats.record_create(room.id, price_cents)
+    cache.invalidate_report(user.org_id)
     cache.invalidate_availability(room.id, start.date().isoformat())
     notifications.notify_created(booking)
 
@@ -206,7 +207,7 @@ def cancel_booking(
     else:
         refund_percent = 0
 
-    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
+    refund_amount_cents = (booking.price_cents * refund_percent + 50) // 100
 
     log_refund(db, booking, refund_percent)
 
