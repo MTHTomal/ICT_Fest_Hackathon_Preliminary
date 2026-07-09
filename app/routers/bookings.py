@@ -189,8 +189,7 @@ def cancel_booking(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # Status check and refund write ran separately before. (previous bug)
-    with _booking_write_lock:  # bug fixed: serialize cancellation so only one refund log is created
+    with _booking_write_lock:  
         booking = (
             db.query(Booking)
             .join(Room, Booking.room_id == Room.id)
@@ -214,26 +213,20 @@ def cancel_booking(
         else:
             refund_percent = 0
 
-    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
-
-        try:
-            log_refund(db, booking, refund_percent)
-        except IntegrityError:
-            db.rollback()
-            raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
-
-        _settlement_pause()
+        refund_entry = log_refund(db, booking, refund_percent)
         booking.status = "cancelled"
         db.commit()
 
         stats.record_cancel(booking.room_id, booking.price_cents)
         cache.invalidate_report(user.org_id)
         cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
+
+    _settlement_pause()
     notifications.notify_cancelled(booking)
 
     return {
         "id": booking.id,
         "status": "cancelled",
         "refund_percent": refund_percent,
-        "refund_amount_cents": refund_amount_cents,
+        "refund_amount_cents": refund_entry.amount_cents,
     }
