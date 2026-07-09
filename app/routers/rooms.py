@@ -117,3 +117,4 @@ def room_stats(
         "room_id": room.id,
         "total_confirmed_bookings": confirmed_count,
         "total_revenue_cents": revenue_cents,  # bug fixed
+    }
