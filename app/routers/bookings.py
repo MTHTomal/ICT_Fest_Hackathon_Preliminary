@@ -116,7 +116,7 @@ def create_booking(
             start_time=start,
             end_time=end,
             status="confirmed",
-            reference_code=reference.next_reference_code(),
+            reference_code=reference.next_reference_code(db),
             price_cents=price_cents,
             created_at=now,
         )
@@ -167,7 +167,8 @@ def get_booking(
         .filter(Booking.id == booking_id, Room.org_id == user.org_id)
         .first()
     )
-    if booking is None:
+    # if booking is None: (previous bug: members could read another member's booking)
+    if booking is None or (user.role != "admin" and booking.user_id != user.id):  # bug fixed: member can read only own booking
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
     response = serialize_booking(booking)

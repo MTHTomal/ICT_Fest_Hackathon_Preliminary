@@ -594,3 +594,73 @@ with _registration_lock:
         db.rollback()
         raise AppError(409, "USERNAME_TAKEN", "Username already exists")
 ```
+
+---
+
+## 20. File: `routers/bookings.py`
+
+### According to Rule
+
+**Booking Visibility:** Members may read and cancel only their own bookings. Another member's booking id must return `404 BOOKING_NOT_FOUND`. Admins may read and cancel any booking in their org.
+
+### Bug
+
+```python
+if booking is None:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+```
+
+### Issue
+
+The booking details endpoint only checked whether the booking belonged to the user's organization. A non-admin member could read another member's booking details in the same organization.
+
+### Fixed
+
+```python
+if booking is None or (user.role != "admin" and booking.user_id != user.id):
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+```
+
+---
+
+## 21. File: `services/reference.py`
+
+### According to Rule
+
+**Reference Codes:** Every booking's `reference_code` is unique, including under concurrent creation.
+
+### Bug
+
+```python
+_counter = {"value": 1000}
+
+def next_reference_code() -> str:
+    with _counter_lock:
+        current = _counter["value"]
+        _counter["value"] = current + 1
+```
+
+### Issue
+
+The reference-code counter always started at `1000` in memory. After an app restart with persisted bookings, the generator could reuse an existing code such as `CW-001000`, causing a valid booking request to fail on the unique reference-code constraint.
+
+### Fixed
+
+```python
+def _next_persisted_value(db: Session) -> int:
+    codes = db.query(Booking.reference_code).filter(Booking.reference_code.like("CW-%")).all()
+    values = []
+    for (code,) in codes:
+        try:
+            values.append(int(code.removeprefix("CW-")))
+        except ValueError:
+            continue
+    return max(values, default=999) + 1
+
+
+def next_reference_code(db: Session) -> str:
+    with _counter_lock:
+        current = max(_counter["value"], _next_persisted_value(db))
+        _counter["value"] = current + 1
+    return f"CW-{current:06d}"
+```
