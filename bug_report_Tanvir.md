@@ -290,3 +290,307 @@ The refresh endpoint issues a new refresh token without invalidating the one tha
 ### Fixed
 
 Invalidate the presented refresh token (or its `jti`) before issuing a new refresh token. The exact implementation depends on `auth.py`.
+
+---
+
+## 11. File: `services/export.py`
+
+### According to Rule
+
+**Multi-tenancy:** Every code path must enforce organization scoping; cross-org resource IDs behave as non-existent.
+
+### Bug
+
+```python
+if include_all:
+    if room_id is not None:
+        rows = fetch_bookings_raw(db, room_id)
+```
+
+### Issue
+
+When `include_all=True` and `room_id` is provided, the export query loads bookings by room ID only. An admin can export bookings from another organization by guessing a cross-org room ID.
+
+### Fixed
+
+```python
+if room_id is not None:
+    room = db.query(Room).filter(Room.id == room_id, Room.org_id == org_id).first()
+    if room is None:
+        raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+
+rows = fetch_bookings_raw(db, org_id, room_id)
+```
+
+---
+
+## 12. File: `routers/bookings.py`
+
+### According to Rule
+
+**No Double-Booking:** The no-double-booking guarantee must hold under concurrent requests.
+
+### Bug
+
+```python
+if _has_conflict(db, room.id, start, end):
+    raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+
+db.add(booking)
+db.commit()
+```
+
+### Issue
+
+The conflict check and insert were not protected as one critical section. Two concurrent requests for the same room and overlapping interval could both pass the conflict check before either booking was committed.
+
+### Fixed
+
+```python
+with _booking_write_lock:
+    if _has_conflict(db, room.id, start, end):
+        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+
+    db.add(booking)
+    db.commit()
+```
+
+---
+
+## 13. File: `routers/bookings.py`
+
+### According to Rule
+
+**Booking Quota:** A member may hold at most 3 confirmed bookings in `(now, now + 24h]`, and the rule must hold under concurrent requests.
+
+### Bug
+
+```python
+_check_quota(db, user.id, now, start)
+
+db.add(booking)
+db.commit()
+```
+
+### Issue
+
+Quota checking and booking creation were not atomic. Concurrent requests could all observe the same quota count and then commit more than three bookings in the quota window.
+
+### Fixed
+
+```python
+with _booking_write_lock:
+    _check_quota(db, user.id, now, start)
+
+    db.add(booking)
+    db.commit()
+```
+
+---
+
+## 14. File: `services/reference.py` and `models.py`
+
+### According to Rule
+
+**Reference Codes:** Every booking's `reference_code` is unique, including under concurrent creation.
+
+### Bug
+
+```python
+current = _counter["value"]
+_format_pause()
+_counter["value"] = current + 1
+```
+
+### Issue
+
+The in-memory counter was read and updated without synchronization, allowing concurrent calls to return the same reference code. The database model also did not enforce uniqueness on `Booking.reference_code`.
+
+### Fixed
+
+```python
+with _counter_lock:
+    current = _counter["value"]
+    _format_pause()
+    _counter["value"] = current + 1
+```
+
+```python
+reference_code = Column(String, nullable=False, unique=True, index=True)
+```
+
+---
+
+## 15. File: `services/ratelimit.py`
+
+### According to Rule
+
+**Rate Limit:** `POST /bookings` is limited to 20 requests per rolling 60 seconds per user, and the rule must hold under concurrent requests.
+
+### Bug
+
+```python
+bucket = _buckets.get(user_id, [])
+bucket = [t for t in bucket if t > now - _WINDOW_SECONDS]
+bucket.append(now)
+_buckets[user_id] = bucket
+```
+
+### Issue
+
+The rate-limit bucket was read, modified, and written without synchronization. Concurrent requests could lose updates and allow more than 20 booking attempts inside the rolling window.
+
+### Fixed
+
+```python
+with _bucket_lock:
+    bucket = _buckets.get(user_id, [])
+    bucket = [t for t in bucket if t > now - _WINDOW_SECONDS]
+    bucket.append(now)
+    _buckets[user_id] = bucket
+```
+
+---
+
+## 16. File: `routers/bookings.py` and `models.py`
+
+### According to Rule
+
+**Cancellation:** Cancelling an already-cancelled booking returns `409 ALREADY_CANCELLED`. A cancelled booking has exactly one `RefundLog` entry.
+
+### Bug
+
+```python
+if booking.status == "cancelled":
+    raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+
+log_refund(db, booking, refund_percent)
+booking.status = "cancelled"
+db.commit()
+```
+
+### Issue
+
+The status check, refund log creation, and status update were not protected as one critical section. Two concurrent cancellations could both pass the status check and create duplicate refund logs.
+
+### Fixed
+
+```python
+with _booking_write_lock:
+    if booking.status == "cancelled":
+        raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+
+    log_refund(db, booking, refund_percent)
+    booking.status = "cancelled"
+    db.commit()
+```
+
+```python
+booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, unique=True, index=True)
+```
+
+---
+
+## 17. File: `routers/rooms.py`
+
+### According to Rule
+
+**Room Stats:** `/rooms/{id}/stats` must always equal the values derivable from confirmed bookings.
+
+### Bug
+
+```python
+current = stats.get(room.id)
+return {
+    "total_confirmed_bookings": current["count"],
+    "total_revenue_cents": current["revenue"],
+}
+```
+
+### Issue
+
+Room stats were served from a process-local dictionary. The dictionary can be empty after restart or drift from the database under concurrent create/cancel operations.
+
+### Fixed
+
+```python
+confirmed_count, revenue_cents = (
+    db.query(func.count(Booking.id), func.coalesce(func.sum(Booking.price_cents), 0))
+    .filter(Booking.room_id == room.id, Booking.status == "confirmed")
+    .one()
+)
+```
+
+---
+
+## 18. File: `services/notifications.py`
+
+### According to Rule
+
+**Liveness:** No combination of concurrent valid requests may hang the service.
+
+### Bug
+
+```python
+def notify_created(booking):
+    with _email_lock:
+        with _audit_lock:
+            ...
+
+def notify_cancelled(booking):
+    with _audit_lock:
+        with _email_lock:
+            ...
+```
+
+### Issue
+
+The two notification paths acquired locks in opposite orders. Concurrent create and cancel notifications could deadlock by each holding one lock while waiting for the other.
+
+### Fixed
+
+```python
+def notify_cancelled(booking):
+    with _email_lock:
+        with _audit_lock:
+            ...
+```
+
+---
+
+## 19. File: `routers/auth.py`
+
+### According to Rule
+
+**Registration:** A duplicate username within the organization must return `409 USERNAME_TAKEN`.
+
+### Bug
+
+```python
+existing = db.query(User).filter(...).first()
+if existing is not None:
+    raise AppError(409, "USERNAME_TAKEN", "Username already exists")
+
+db.add(user)
+db.commit()
+```
+
+### Issue
+
+The duplicate lookup and insert were not protected against concurrent registration. Two requests could both pass the lookup, and the database unique constraint could raise an unhandled integrity error during commit.
+
+### Fixed
+
+```python
+with _registration_lock:
+    existing = db.query(User).filter(...).first()
+    if existing is not None:
+        raise AppError(409, "USERNAME_TAKEN", "Username already exists")
+
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise AppError(409, "USERNAME_TAKEN", "Username already exists")
+```

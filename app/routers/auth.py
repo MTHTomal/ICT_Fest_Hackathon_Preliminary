@@ -1,5 +1,8 @@
 """Authentication endpoints: register, login, refresh, logout."""
+import threading
+
 from fastapi import APIRouter, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -18,41 +21,56 @@ from ..models import Organization, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+_registration_lock = threading.Lock()
 
 
 @router.post("/register", status_code=201)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    org = db.query(Organization).filter(Organization.name == payload.org_name).first()
-    role = "admin" if org is None else "member"
-    if org is None:
-        org = Organization(name=payload.org_name)
-        db.add(org)
-        db.commit()
-        db.refresh(org)
+    # Duplicate lookup and insert ran separately before. (previous bug)
+    with _registration_lock:  # bug fixed: serialize registration checks in-process
+        org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+        role = "admin" if org is None else "member"
+        if org is None:
+            org = Organization(name=payload.org_name)
+            db.add(org)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+                if org is None:
+                    raise
+                role = "member"
+            else:
+                db.refresh(org)
 
-    existing = (
-        db.query(User)
-        .filter(User.org_id == org.id, User.username == payload.username)
-        .first()
-    )
-    if existing is not None:
-        raise AppError(409, "USERNAME_TAKEN", "Username already exists")
+        existing = (
+            db.query(User)
+            .filter(User.org_id == org.id, User.username == payload.username)
+            .first()
+        )
+        if existing is not None:
+            raise AppError(409, "USERNAME_TAKEN", "Username already exists")
 
-    user = User(
-        org_id=org.id,
-        username=payload.username,
-        hashed_password=hash_password(payload.password),
-        role=role,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return {
-        "user_id": user.id,
-        "org_id": org.id,
-        "username": user.username,
-        "role": user.role,
-    }
+        user = User(
+            org_id=org.id,
+            username=payload.username,
+            hashed_password=hash_password(payload.password),
+            role=role,
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise AppError(409, "USERNAME_TAKEN", "Username already exists")
+        db.refresh(user)
+        return {
+            "user_id": user.id,
+            "org_id": org.id,
+            "username": user.username,
+            "role": user.role,
+        }
 
 
 @router.post("/login")
