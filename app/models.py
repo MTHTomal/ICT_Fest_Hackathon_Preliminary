@@ -69,3 +69,13 @@ class RefundLog(Base):
     amount_cents = Column(Integer, nullable=False)
     status = Column(String, nullable=False)
     processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class RevokedToken(Base):
+    __tablename__ = "revoked_tokens"
+
+    # _revoked_tokens: set[str] = set() (previous bug: revocation was process-local)
+    jti = Column(String, primary_key=True)  # bug fixed: persist revoked/used token ids
+    token_type = Column(String, nullable=False, index=True)
+    expires_at = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

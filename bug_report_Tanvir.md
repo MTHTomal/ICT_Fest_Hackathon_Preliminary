@@ -664,3 +664,93 @@ def next_reference_code(db: Session) -> str:
         _counter["value"] = current + 1
     return f"CW-{current:06d}"
 ```
+
+---
+
+## 22. File: `auth.py` and `models.py`
+
+### According to Rule
+
+**Auth:** Logout immediately invalidates the presented access token for all further use. Refresh tokens are single-use and reuse must return `401`.
+
+### Bug
+
+```python
+_revoked_tokens: set[str] = set()
+_revoked_refresh_tokens: set[str] = set()
+```
+
+### Issue
+
+Access-token revocation and used refresh-token tracking were kept only in process memory. After an app restart with the same database and JWT secret, logged-out access tokens and already-used refresh tokens could become valid again.
+
+### Fixed
+
+```python
+class RevokedToken(Base):
+    __tablename__ = "revoked_tokens"
+
+    jti = Column(String, primary_key=True)
+    token_type = Column(String, nullable=False, index=True)
+    expires_at = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+```
+
+```python
+def revoke_access_token(payload: dict, db: Session) -> None:
+    _persist_revoked_token(db, payload)
+    _revoked_tokens.add(payload["jti"])
+```
+
+```python
+def consume_refresh_token(payload: dict, db: Session) -> bool:
+    ...
+    if not _persist_revoked_token(db, payload):
+        return False
+```
+
+---
+
+## 23. File: `routers/admin.py` and `cache.py`
+
+### According to Rule
+
+**Usage Report:** The report must reflect the current state immediately.
+
+### Bug
+
+```python
+cached = cache.get_report(admin.org_id, frm, to)
+if cached is not None:
+    return cached
+
+# query database
+
+cache.set_report(admin.org_id, frm, to, result)
+```
+
+### Issue
+
+Report generation and cache writes were not synchronized with cache invalidation. A report request could compute old data, then write that stale result into the cache after a booking or room change had already invalidated the previous cache entry.
+
+### Fixed
+
+```python
+def get_or_set_report(org_id: int, frm: str, to: str, build):
+    with _report_lock:
+        cached = _report_cache.get((org_id, frm, to))
+        if cached is not None:
+            return cached
+        result = build()
+        _report_cache[(org_id, frm, to)] = result
+        return result
+```
+
+```python
+return cache.get_or_set_report(
+    admin.org_id,
+    frm,
+    to,
+    build_report,
+)
+```

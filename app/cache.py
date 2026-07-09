@@ -4,22 +4,38 @@ Usage reports and per-room availability are relatively expensive to compute and
 are read far more often than the underlying data changes, so results are cached
 and invalidated when the data they depend on is modified.
 """
+import threading
 
 _report_cache: dict[tuple, dict] = {}
 _availability_cache: dict[tuple, dict] = {}
+_report_lock = threading.Lock()
 
 
 def get_report(org_id: int, frm: str, to: str):
-    return _report_cache.get((org_id, frm, to))
+    with _report_lock:
+        return _report_cache.get((org_id, frm, to))
 
 
 def set_report(org_id: int, frm: str, to: str, value: dict) -> None:
-    _report_cache[(org_id, frm, to)] = value
+    with _report_lock:
+        _report_cache[(org_id, frm, to)] = value
+
+
+def get_or_set_report(org_id: int, frm: str, to: str, build):
+    with _report_lock:
+        cached = _report_cache.get((org_id, frm, to))
+        if cached is not None:
+            return cached
+        result = build()
+        # cache.set_report(...) after an unlocked query (previous bug)
+        _report_cache[(org_id, frm, to)] = result  # bug fixed: build/set is atomic with invalidation
+        return result
 
 
 def invalidate_report(org_id: int) -> None:
-    for key in [k for k in _report_cache if k[0] == org_id]:
-        _report_cache.pop(key, None)
+    with _report_lock:
+        for key in [k for k in _report_cache if k[0] == org_id]:
+            _report_cache.pop(key, None)
 
 
 def get_availability(room_id: int, date: str):

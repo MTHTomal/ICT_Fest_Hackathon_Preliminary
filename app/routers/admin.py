@@ -22,44 +22,47 @@ def usage_report(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    cached = cache.get_report(admin.org_id, frm, to)
-    if cached is not None:
-        return cached
+    def build_report():
+        try:
+            from_date = datetime.strptime(frm, "%Y-%m-%d").date()
+            to_date = datetime.strptime(to, "%Y-%m-%d").date()
+        except ValueError:
+            raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date range")
 
-    try:
-        from_date = datetime.strptime(frm, "%Y-%m-%d").date()
-        to_date = datetime.strptime(to, "%Y-%m-%d").date()
-    except ValueError:
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date range")
+        range_start = datetime.combine(from_date, time.min)
+        range_end = datetime.combine(to_date + timedelta(days=1), time.min)
 
-    range_start = datetime.combine(from_date, time.min)
-    range_end = datetime.combine(to_date + timedelta(days=1), time.min)
-
-    rooms = db.query(Room).filter(Room.org_id == admin.org_id).order_by(Room.id.asc()).all()
-    room_rows = []
-    for room in rooms:
-        bookings = (
-            db.query(Booking)
-            .filter(
-                Booking.room_id == room.id,
-                Booking.status == "confirmed",
-                Booking.start_time >= range_start,
-                Booking.start_time < range_end,
+        rooms = db.query(Room).filter(Room.org_id == admin.org_id).order_by(Room.id.asc()).all()
+        room_rows = []
+        for room in rooms:
+            bookings = (
+                db.query(Booking)
+                .filter(
+                    Booking.room_id == room.id,
+                    Booking.status == "confirmed",
+                    Booking.start_time >= range_start,
+                    Booking.start_time < range_end,
+                )
+                .all()
             )
-            .all()
-        )
-        room_rows.append(
-            {
-                "room_id": room.id,
-                "room_name": room.name,
-                "confirmed_bookings": len(bookings),
-                "revenue_cents": sum(b.price_cents for b in bookings),
-            }
-        )
+            room_rows.append(
+                {
+                    "room_id": room.id,
+                    "room_name": room.name,
+                    "confirmed_bookings": len(bookings),
+                    "revenue_cents": sum(b.price_cents for b in bookings),
+                }
+            )
 
-    result = {"from": frm, "to": to, "rooms": room_rows}
-    cache.set_report(admin.org_id, frm, to, result)
-    return result
+        return {"from": frm, "to": to, "rooms": room_rows}
+
+    # cached = cache.get_report(...); cache.set_report(...) (previous bug)
+    return cache.get_or_set_report(  # bug fixed: report build/set is synchronized with invalidation
+        admin.org_id,
+        frm,
+        to,
+        build_report,
+    )
 
 
 @router.get("/export")

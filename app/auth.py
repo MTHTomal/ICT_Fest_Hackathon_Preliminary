@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import Depends, Request
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import (
@@ -18,7 +19,7 @@ from .config import (
 )
 from .database import get_db
 from .errors import AppError
-from .models import User
+from .models import RevokedToken, User
 
 # Access tokens presented to /auth/logout are recorded here so they can no
 # longer be used.
@@ -86,20 +87,43 @@ def decode_token(token: str) -> dict:
         raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
 
 
-def revoke_access_token(payload: dict) -> None:
+def _persist_revoked_token(db: Session, payload: dict) -> bool:
+    token = RevokedToken(
+        jti=payload["jti"],
+        token_type=payload.get("type", ""),
+        expires_at=int(payload.get("exp", 0)),
+    )
+    db.add(token)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return False
+    return True
+
+
+def revoke_access_token(payload: dict, db: Session) -> None:
+    # _revoked_tokens.add(payload["jti"]) (previous bug: lost on app restart)
+    _persist_revoked_token(db, payload)  # bug fixed: persist access-token revocation
     _revoked_tokens.add(payload["jti"])
 
 
-def consume_refresh_token(payload: dict) -> bool:
+def consume_refresh_token(payload: dict, db: Session) -> bool:
     jti = payload["jti"]
     with _refresh_token_lock:
         if jti in _revoked_refresh_tokens:
+            return False
+        if db.query(RevokedToken).filter(RevokedToken.jti == jti).first() is not None:
+            _revoked_refresh_tokens.add(jti)
+            return False
+        # _revoked_refresh_tokens.add(jti) (previous bug: lost on app restart)
+        if not _persist_revoked_token(db, payload):  # bug fixed: persist used refresh-token ids
             return False
         _revoked_refresh_tokens.add(jti)
     return True
 
 
-def get_token_payload(request: Request) -> dict:
+def get_token_payload(request: Request, db: Session = Depends(get_db)) -> dict:
     header = request.headers.get("Authorization")
     if not header or not header.startswith("Bearer "):
         raise AppError(401, "UNAUTHORIZED", "Missing bearer token")
@@ -107,7 +131,10 @@ def get_token_payload(request: Request) -> dict:
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if payload.get("jti") in _revoked_tokens:           #bug 
+    if payload.get("jti") in _revoked_tokens:           #bug
+        raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+    if db.query(RevokedToken).filter(RevokedToken.jti == payload.get("jti")).first() is not None:
+        _revoked_tokens.add(payload["jti"])  # bug fixed: revoked access token stays invalid after restart
         raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     return payload
 
